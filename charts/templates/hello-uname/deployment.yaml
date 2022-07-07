@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-uname
+  labels:
+    app: hello-uname
+spec:
+  replicas: {{ .Values.helloUname.replicaCount }}
+  selector:
+    matchLabels:
+      app: hello-uname
+  template:
+    metadata:
+      labels:
+        app: hello-uname
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{ if .Values.images.registry.secrets }}
+      imagePullSecrets:
+        - name: {{ .Values.images.registry.secrets }}
+      {{ end }}
+      containers:
+        - name: hello-uname
+          image: "{{ .Values.images.registry.hostname }}/{{ .Values.images.name.helloUname.repo }}:{{ .Values.images.name.helloUname.tag }}"
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

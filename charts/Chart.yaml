@@ -1,0 +1,4 @@
+apiVersion: v2
+name: hello-uname
+description: HTTP server with uname
+version: "0.0.1"

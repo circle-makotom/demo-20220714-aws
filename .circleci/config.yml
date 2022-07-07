@@ -1,0 +1,419 @@
+version: 2.1
+
+parameters:
+  context-docker:
+    type: string
+    default: makotom-only
+  context-k8s:
+    type: string
+    default: makotom-only
+  release-on:
+    type: string
+    default: main
+
+  docker-image-repo:
+    type: string
+    default: makotom/hello-uname
+  aws-account-id:
+    type: string
+    default: "660990364978"
+  aws-role-arn:
+    type: string
+    default: arn:aws:iam::660990364978:role/makoto
+  aws-region:
+    type: string
+    default: ap-northeast-1
+
+executors:
+  default-docker:
+    docker:
+      - image: ubuntu:rolling
+    resource_class: medium
+  bin-builder-amd64:
+    docker:
+      - image: golang:1.18
+  bin-builder-aarch64:
+    machine:
+      image: ubuntu-2004:current
+    resource_class: arm.medium
+  docker-builder-amd64:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: medium
+  docker-builder-aarch64:
+    machine:
+      image: ubuntu-2004:current
+    resource_class: arm.medium
+
+commands:
+  configure-build-version:
+    steps:
+      - run:
+          name: Configuring build version
+          command: |
+            tee -a "${BASH_ENV}" \<<<"export BUILD_VERSION='$(cat version.txt)'"
+
+  setup-awscli:
+    parameters:
+      aws-role-arn:
+        type: string
+      aws-default-region:
+        type: string
+    steps:
+      - run:
+          name: Configure AWS_* environment variables
+          command: |
+            tee -a "${BASH_ENV}" \<<EOD
+            export AWS_ROLE_ARN="${AWS_ROLE_ARN}"
+            export AWS_WEB_IDENTITY_TOKEN_FILE="$(mktemp -u)"
+            export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION}"
+            EOD
+
+            source "${BASH_ENV}"
+            printenv CIRCLE_OIDC_TOKEN > "${AWS_WEB_IDENTITY_TOKEN_FILE}"
+          environment:
+            AWS_ROLE_ARN: << parameters.aws-role-arn >>
+            AWS_DEFAULT_REGION: << parameters.aws-default-region >>
+      - run:
+          name: Install AWS CLI
+          command: |
+            if ! which unzip || ! which curl; then
+              apt update
+              apt install -y curl unzip
+            fi
+
+            curl -fJL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+
+            if which sudo; then
+              sudo ./aws/install --update
+            else
+              ./aws/install --update
+            fi
+          working_directory: /tmp
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+
+  docker-login:
+    parameters:
+      aws-account-id:
+        type: string
+      aws-region:
+        type: string
+      aws-role-arn:
+        type: string
+    steps:
+      - setup-awscli:
+          aws-role-arn: << parameters.aws-role-arn >>
+          aws-default-region: << parameters.aws-region >>
+      - run:
+          name: Get a token for Amazon ECR and pass it to Docker CLI
+          command: |
+            aws ecr get-login-password --region "${AWS_REGION}" | docker login -u AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          environment:
+            AWS_ACCOUNT_ID: << parameters.aws-account-id >>
+            AWS_REGION: << parameters.aws-region >>
+
+  install-kube-toolchain:
+    steps:
+      - run:
+          name: Install cURL
+          command: |
+            apt update
+            apt install -y curl
+          environment:
+            DEBIAN_FRONTEND: noninteractive
+      - run:
+          name: Install kubectl
+          working_directory: /tmp/kubectl
+          command: |
+            curl -fsSJLO "https://dl.k8s.io/release/${K8S_VERSION}/bin/linux/amd64/kubectl"
+            sha256sum --check \<<<"$(curl -fsSJL "https://dl.k8s.io/${K8S_VERSION}/bin/linux/amd64/kubectl.sha256") kubectl"
+            install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          environment:
+            K8S_VERSION: v1.22.6
+      - run:
+          name: Install Helm
+          working_directory: /tmp/helm
+          command: |
+            curl -fsSJL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar -xz
+            install -o root -g root -m 0755 linux-amd64/helm /usr/local/bin/helm
+          environment:
+            HELM_VERSION: v3.8.2
+
+  setup-kubeconfig:
+    parameters:
+      aws-role-arn:
+        type: string
+      cluster-name:
+        type: string
+      aws-region:
+        type: string
+    steps:
+      - setup-awscli:
+          aws-role-arn: << parameters.aws-role-arn >>
+          aws-default-region: << parameters.aws-region >>
+      - run:
+          command: aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+          environment:
+            CLUSTER_NAME: << parameters.cluster-name >>
+            AWS_REGION: << parameters.aws-region >>
+
+jobs:
+  prerequisites:
+    executor: default-docker
+    steps:
+      - checkout
+      - run:
+          name: Compute version number
+          command: tee version.txt \<<<"${CIRCLE_BUILD_NUM}-${CIRCLE_SHA1:0:7}"
+      - persist_to_workspace:
+          root: .
+          paths:
+            - .
+
+  build-bin:
+    parameters:
+      arch:
+        description: Target CPU architecture
+        type: string
+    executor: bin-builder-<< parameters.arch >>
+    steps:
+      - attach_workspace:
+          at: .
+      - configure-build-version
+      - run:
+          command: go build -ldflags "-X main.BuildVersion=${BUILD_VERSION} -X main.BuildTimeStamp=$(date --iso-8601=seconds)" -o "dist/${ARCH}/hello-uname-server" .
+          environment:
+            ARCH: << parameters.arch >>
+      - store_artifacts:
+          path: dist
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist
+
+  smoke-test:
+    parameters:
+      arch:
+        description: Target CPU architecture
+        type: string
+    executor: bin-builder-<< parameters.arch >>
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Execute the deliverable executable
+          command: "dist/${ARCH}/hello-uname-server"
+          environment:
+            ARCH: << parameters.arch >>
+          background: true
+      - run:
+          name: Make sure that the server is responding
+          command: |
+            for iter in $(seq 1 5); do
+              if curl -sSJL http://localhost:8080/; then
+                exit 0
+              fi
+              sleep 1
+            done
+            exit 1
+
+  unit-test:
+    parameters:
+      arch:
+        description: Target CPU architecture
+        type: string
+    executor: bin-builder-<< parameters.arch >>
+    parallelism: 2
+    steps:
+      - attach_workspace:
+          at: .
+      - run:
+          name: Install gotestsum
+          command: |
+            go get gotest.tools/gotestsum
+            go install gotest.tools/gotestsum
+      - run:
+          name: gotestsum
+          command: |
+            go list ./... | circleci tests split --split-by=timings | xargs gotestsum --junitfile test-results.xml
+      - store_artifacts: # For human reading
+          path: test-results.xml
+      - store_test_results: # For machine reading and optimal test splitting in the future
+          path: test-results.xml
+
+  build-docker-image:
+    parameters:
+      repo:
+        type: string
+      arch:
+        type: string
+
+      aws-account-id:
+        type: string
+      aws-region:
+        type: string
+      aws-role-arn:
+        type: string
+    executor: docker-builder-<< parameters.arch >>
+    environment:
+      DOCKER_REGISTRY: << parameters.aws-account-id >>.dkr.ecr.<< parameters.aws-region >>.amazonaws.com
+      DOCKER_IMAGE_REPO: << parameters.repo >>
+    steps:
+      - attach_workspace:
+          at: .
+      - configure-build-version
+      - run:
+          name: Configuring image tag
+          command: |
+            tee -a "${BASH_ENV}" \<<<"export DOCKER_IMAGE_TAG='${BUILD_VERSION}-${ARCH}'"
+            tee -a "${BASH_ENV}" \<<<'export DOCKER_IMAGE_NAME="${DOCKER_REGISTRY}/${DOCKER_IMAGE_REPO}:${DOCKER_IMAGE_TAG}"'
+          environment:
+            ARCH: << parameters.arch >>
+      - run:
+          name: docker build
+          command: |
+            docker build --build-arg ARCH="${ARCH}" -t "${DOCKER_IMAGE_NAME}" .
+          environment:
+            ARCH: << parameters.arch >>
+
+      - docker-login:
+          aws-account-id: << parameters.aws-account-id >>
+          aws-region: << parameters.aws-region >>
+          aws-role-arn: << parameters.aws-role-arn >>
+
+      - run:
+          name: docker push
+          command: docker push "${DOCKER_IMAGE_NAME}"
+
+  create-multi-arch-manifest:
+    executor: docker-builder-aarch64
+    parameters:
+      aws-account-id:
+        type: string
+      aws-region:
+        type: string
+      repo:
+        type: string
+      aws-role-arn:
+        type: string
+    environment:
+      REGISTRY: << parameters.aws-account-id >>.dkr.ecr.<< parameters.aws-region >>.amazonaws.com
+      IMAGE: << parameters.repo >>
+    steps:
+      - attach_workspace:
+          at: .
+      - configure-build-version
+      - docker-login:
+          aws-account-id: << parameters.aws-account-id >>
+          aws-region: << parameters.aws-region >>
+          aws-role-arn: << parameters.aws-role-arn >>
+      - run:
+          name: Create manifest
+          command: |
+            docker manifest create \
+              "${REGISTRY}/${IMAGE}:${BUILD_VERSION}" \
+              --amend "${REGISTRY}/${IMAGE}:${BUILD_VERSION}-amd64" \
+              --amend "${REGISTRY}/${IMAGE}:${BUILD_VERSION}-aarch64"
+      - run:
+          name: Push manifest
+          command: docker manifest push "${REGISTRY}/${IMAGE}:${BUILD_VERSION}"
+
+  deploy-helm:
+    executor: default-docker
+    parameters:
+      aws-role-arn:
+        type: string
+      cluster-name:
+        type: string
+      aws-region:
+        type: string
+    environment:
+      HELM_APP_NAME: hello-uname
+      K8S_NS: hello-uname
+    steps:
+      - checkout
+      - attach_workspace:
+          at: .
+
+      - install-kube-toolchain
+      - setup-kubeconfig:
+          aws-role-arn: << parameters.aws-role-arn >>
+          cluster-name: << parameters.cluster-name >>
+          aws-region: << parameters.aws-region >>
+
+      - run:
+          name: Deploy with Helm
+          working_directory: charts
+          command: |
+            helm upgrade --install --create-namespace -n "${K8S_NS}" --set images.name.helloUname.tag="$(cat ../version.txt)" "${HELM_APP_NAME}" .
+          environment:
+            CLUSTER_NAME: << parameters.cluster-name >>
+
+workflows:
+  run:
+    jobs:
+      - prerequisites
+      - build-bin:
+          requires:
+            - prerequisites
+          matrix:
+            parameters:
+              arch:
+                - amd64
+                - aarch64
+
+      - smoke-test:
+          requires:
+            - build-bin
+          matrix:
+            parameters:
+              arch:
+                - amd64
+                - aarch64
+      - unit-test:
+          requires:
+            - prerequisites
+          matrix:
+            parameters:
+              arch:
+                - amd64
+                - aarch64
+
+      - build-docker-image:
+          requires:
+            - smoke-test
+            - unit-test
+          context:
+            - << pipeline.parameters.context-docker >>
+          matrix:
+            parameters:
+              arch:
+                - amd64
+                - aarch64
+          repo: << pipeline.parameters.docker-image-repo >>
+          aws-account-id: << pipeline.parameters.aws-account-id >>
+          aws-region: << pipeline.parameters.aws-region >>
+          aws-role-arn: << pipeline.parameters.aws-role-arn >>
+      - create-multi-arch-manifest:
+          requires:
+            - build-docker-image
+          context:
+            - << pipeline.parameters.context-docker >>
+          aws-account-id: << pipeline.parameters.aws-account-id >>
+          aws-region: << pipeline.parameters.aws-region >>
+          repo: << pipeline.parameters.docker-image-repo >>
+          aws-role-arn: << pipeline.parameters.aws-role-arn >>
+
+      - deploy-helm:
+          requires:
+            - create-multi-arch-manifest
+          context:
+            - << pipeline.parameters.context-k8s >>
+          cluster-name: makoto-eks-arm64
+          aws-role-arn: << pipeline.parameters.aws-role-arn >>
+          aws-region: << pipeline.parameters.aws-region >>
+          filters:
+            branches:
+              only: << pipeline.parameters.release-on >>
